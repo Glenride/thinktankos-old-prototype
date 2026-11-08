@@ -1,0 +1,197 @@
+# PRODUCT REQUIREMENTS DOCUMENT (PRD)
+
+## Project Name: ThinkTank OS
+
+### Core Concept
+A proprietary, multi-tenant B2B SaaS platform engineered for policy institutes, research foundations, and think tanks to manage scholar rosters, editorial publishing pipelines with strict embargo controls, and high-stakes confidential events with kernel-level tenant isolation.
+
+### Tech Stack
+* **Backend**: Laravel 11, PHP 8.4
+* **Frontend**: React 18 / Inertia.js, Tailwind CSS (Clean High-Contrast Light Theme)
+* **Database**: Native PostgreSQL with Row-Level Security (RLS)
+* **Queue / Workers**: Redis & Laravel Horizon
+
+---
+
+## 1. Core Architectural & UI Principles
+
+* **Zero-Leak Tenant Perimeter**: Tenant isolation is guaranteed at the PostgreSQL engine layer via Row-Level Security (`FORCE ROW LEVEL SECURITY`), preventing data bleeding across organizations even during raw SQL execution or background queue jobs.
+* **Composite Relational Integrity**: All tenant-scoped entities enforce composite foreign keys and composite unique constraints `(tenant_id, ...)` to eliminate slug collisions and cross-tenant foreign key hijacking.
+* **Clean Light-Mode Focus Architecture**: High-contrast, stark white background paired with Slate grays and crisp typography (Inter for UI, Cabinet Grotesk for section titles), designed for extended editorial review without cognitive fatigue.
+* **Strict MVC & Anti-Overfetching**: Controllers transform database entities into strict `JsonResource` or DTO representations before passing them to Inertia, eliminating the risk of serializing draft notes, reviewer comments, or private contact details to the browser.
+
+---
+
+## 2. Core Functional Modules
+
+### Module A: Tenancy, Identity & RBAC
+* **REQ-1.1: Global Identity Decoupling**: Global user authentication (`users`) decoupled from organization-level memberships (`tenant_users`), allowing fellows and scholars to hold concurrent appointments across multiple institutes without account duplication.
+* **REQ-1.2: Strict PostgreSQL Session Scoping**: Request middleware injects the active tenant ID directly into PostgreSQL session configuration (`app.current_tenant_id`) with mandatory cleanup on request termination.
+* **REQ-1.3: Role-Based Access Control**: Granular roles (`Institute Director`, `Managing Editor`, `Research Fellow`, `Event Coordinator`) enforced at both the policy and route levels.
+
+### Module B: The Scholar & Talent Matrix
+* **REQ-2.1: Tenant-Scoped Scholar Profiles**: Comprehensive scholar database tracking bios, institutional titles, external academic affiliations, and research program assignments.
+* **REQ-2.2: Expertise Taxonomies**: Native PostgreSQL array tagging (`expertise_tags TEXT[]`) indexed via GIN for high-speed faceted search across geopolitical and domestic policy domains.
+
+### Module C: Policy Publishing & Editorial Pipeline
+* **REQ-3.1: Immutable Revision History**: Document body stored in child version tables (`publication_versions`), ensuring every editorial revision, peer review cycle, and changelog entry is preserved with author attribution.
+* **REQ-3.2: Automated Embargo Engine**: Scheduled publishing engine locking embargoed research briefs down to the minute, preventing access by unauthorized roles or public APIs until release.
+* **REQ-3.3: Composite Authorship**: Multi-author association linking internal fellows and external guest scholars with display ordering and lead author designations.
+
+### Module D: High-Stakes Events & Salons
+* **REQ-4.1: Chatham House Rule Governance**: Dedicated event categorization supporting public conferences, invitation-only roundtables, and off-the-record executive salons.
+* **REQ-4.2: VIP Registration & Vetting**: Guest list management with status workflows (`pending`, `vetted`, `approved`, `declined`, `attended`) and encrypted contact metadata.
+
+### Module E: Agentic Synthesis & AI Ingestion
+* **REQ-5.1: Tenant-Scoped Horizon Queue Workers**: Dedicated background queues that ingest policy notes or event transcripts, executing with tenant session context injected into the worker runtime.
+* **REQ-5.2: Prompt Sanitization & Leak Prevention**: Ingestion pipelines that sanitize stakeholder PII and isolate LLM context boundaries to prevent cross-tenant vector or context contamination.
+
+---
+
+## 3. Database Schema Blueprint
+
+```sql
+-- Core Tenants
+CREATE TABLE tenants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) NOT NULL UNIQUE,
+    custom_domain VARCHAR(255) UNIQUE,
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Global User Authentication
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    remember_token VARCHAR(100),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Organization Memberships (RBAC)
+CREATE TABLE tenant_users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL,
+    permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tenant_user UNIQUE (tenant_id, user_id)
+);
+
+-- Talent Profiles
+CREATE TABLE scholars (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    slug VARCHAR(150) NOT NULL,
+    title VARCHAR(150) NOT NULL,
+    bio TEXT,
+    expertise_tags TEXT[] DEFAULT '{}',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_scholar_slug_per_tenant UNIQUE (tenant_id, slug),
+    CONSTRAINT uq_scholar_composite UNIQUE (id, tenant_id)
+);
+
+-- Publishing: Core Policy Briefs
+CREATE TABLE publications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    title VARCHAR(500) NOT NULL,
+    slug VARCHAR(500) NOT NULL,
+    summary TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'draft',
+    embargo_until TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_publication_slug_per_tenant UNIQUE (tenant_id, slug),
+    CONSTRAINT uq_publication_composite UNIQUE (id, tenant_id)
+);
+
+-- Publishing: Revisions & Editorial Versions
+CREATE TABLE publication_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    publication_id UUID NOT NULL,
+    version_number INT NOT NULL,
+    content JSONB NOT NULL,
+    changelog TEXT,
+    created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (publication_id, tenant_id) 
+        REFERENCES publications(id, tenant_id) ON DELETE CASCADE,
+    CONSTRAINT uq_version_per_publication UNIQUE (publication_id, version_number)
+);
+
+-- Publishing: Authorship Junction
+CREATE TABLE publication_authors (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    publication_id UUID NOT NULL,
+    scholar_id UUID,
+    external_author_name VARCHAR(255),
+    display_order INT NOT NULL DEFAULT 1,
+    is_lead_author BOOLEAN NOT NULL DEFAULT FALSE,
+    FOREIGN KEY (publication_id, tenant_id) 
+        REFERENCES publications(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (scholar_id, tenant_id) 
+        REFERENCES scholars(id, tenant_id) ON DELETE SET NULL
+);
+
+-- Events: Roundtables & Salons
+CREATE TABLE events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    title VARCHAR(300) NOT NULL,
+    slug VARCHAR(300) NOT NULL,
+    description TEXT,
+    chatham_house_rule BOOLEAN NOT NULL DEFAULT FALSE,
+    visibility VARCHAR(50) NOT NULL DEFAULT 'private',
+    starts_at TIMESTAMPTZ NOT NULL,
+    ends_at TIMESTAMPTZ NOT NULL,
+    capacity INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_event_slug_per_tenant UNIQUE (tenant_id, slug),
+    CONSTRAINT uq_event_composite UNIQUE (id, tenant_id)
+);
+
+-- Events: VIP Attendee Registrations
+CREATE TABLE event_registrations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    event_id UUID NOT NULL,
+    full_name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    organization VARCHAR(255),
+    title VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    checked_in_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (event_id, tenant_id) 
+        REFERENCES events(id, tenant_id) ON DELETE CASCADE,
+    CONSTRAINT uq_event_registration UNIQUE (event_id, email)
+);
+```
+
+---
+
+## 4. Implementation Phasing
+
+1. **Sprint 1**: Foundation & Scaffolding (Laravel 11, Breeze React/Inertia, PostgreSQL RLS base macros).
+2. **Sprint 2**: Tenancy Middleware & RBAC (Multi-tenant domain resolution, session isolation, user authentication).
+3. **Sprint 3**: Talent Matrix (Scholar CRUD, expertise indexing, public bio generation).
+4. **Sprint 4**: Policy Editorial Pipeline (Structured draft editor, version diffing, automated embargo release).
+5. **Sprint 5**: Salon & Event Management (VIP registration, Chatham House workflows, check-in console).
+6. **Sprint 6**: Agentic Synthesis (Laravel Horizon worker pipelines, LLM-driven brief generation).
